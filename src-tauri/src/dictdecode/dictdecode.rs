@@ -1,16 +1,18 @@
+use crate::lib_hashes;
 use instant::Instant;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::io::prelude::*;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::process;
-
-use super::hashes;
+use tauri::{AppHandle, Manager};
 
 lazy_static! {
+    static ref WINDOWS_NEWLINE_PATTERN: String = format!("\r\n");
+    static ref UNIX_NEWLINE_PATTERN: String = format!("\n");
     static ref SAVE_HASHES_PATH: String = format!("./saved");
     static ref LOCAL_HASH_PATH: String = format!("./saved/hashes.saved");
 }
@@ -18,11 +20,17 @@ lazy_static! {
 // debug
 static mut LOAD_TIME: u128 = 0;
 
+// log event payload
+#[derive(Clone, serde::Serialize)]
+struct Payload {
+    message: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct LocalHash {
     hash: String,
     plaintext: String,
-} 
+}
 
 fn load_local_hive() -> Vec<LocalHash> {
     let json_file_path = Path::new(&*LOCAL_HASH_PATH);
@@ -35,19 +43,31 @@ fn load_local_hive() -> Vec<LocalHash> {
     local_hive
 }
 
-fn crack(line: &str, hash_len: usize, hash_input: &str, now: std::time::Instant) {
-    let formatted_hash: String = hashes::define_hash(line, hash_len);
+fn crack(
+    app: tauri::AppHandle,
+    line: &str,
+    hash_len: usize,
+    hash_input: &str,
+    now: std::time::Instant,
+) {
+    let formatted_hash: String = lib_hashes::define_hash(line, hash_len);
 
     if formatted_hash == hash_input {
         unsafe {
-            println!(
-                "🤍 Cracked! {} -> \"{}\" in {} ms",
-                formatted_hash,
-                line,
-                now.elapsed().as_millis() - LOAD_TIME
-            );
+            app.emit_all(
+                "hash-cracked",
+                Payload {
+                    message: format!(
+                        "Cracked! {} -> \"{}\" in {} ms",
+                        formatted_hash,
+                        line,
+                        now.elapsed().as_millis() - LOAD_TIME
+                    ),
+                },
+            )
+            .unwrap();
         }
-        
+
         // loading the hash file, adding the new hash and saving locally.
         let mut local_hive = load_local_hive();
 
@@ -66,19 +86,13 @@ fn crack(line: &str, hash_len: usize, hash_input: &str, now: std::time::Instant)
             .open(&*LOCAL_HASH_PATH)
             .unwrap();
 
-        // let mut file_write = fs::File::create(&*LOCAL_HASH_PATH);
-        // println!("{:x}", file_write.bytes());
-        //println!("{:x}", json);
-
         if let Err(e) = writeln!(file_write, "{}", &json) {
             eprintln!("Couldn't write to file: {}", e);
         }
-
-        // process::exit(0);
     }
 }
 
-pub fn decode(wordlist_file: &str, hash_input: &str) {
+pub fn decode(app: AppHandle, wordlist_file: &str, hash_input: &str) -> std::io::Result<()> {
     // check for saved hashes locally
     let _ = fs::create_dir_all(&*SAVE_HASHES_PATH);
 
@@ -106,30 +120,36 @@ pub fn decode(wordlist_file: &str, hash_input: &str) {
         }
     }
 
-    // sanity check
-    let valid_lens = vec![32, 40, 64, 128];
     let hash_len = hash_input.len();
-    if !valid_lens.contains(&hash_len) {
-        println!("❌ Invalid hash length!");
-        //process::exit(1);
-    }
-
     let now = Instant::now();
 
     let file = fs::read_to_string(wordlist_file).unwrap();
-    let newline_split = file.split("\n");
+    let mut newline_split;
+
+    // check new line splitter on OS types
+    if (env::consts::OS == "windows") {
+        newline_split = file.split(&*WINDOWS_NEWLINE_PATTERN);
+    } else {
+        newline_split = file.split(&*UNIX_NEWLINE_PATTERN);
+    }
+
     let dict: Vec<&str> = newline_split.collect();
 
     // debug
     unsafe {
         LOAD_TIME = now.elapsed().as_millis();
-        println!("loaded the wordlist file in {} millisecs.", LOAD_TIME);
+        app.emit_all(
+            "wordlist-loaded",
+            Payload {
+                message: format!("loaded the wordlist file in {} millisecs.", LOAD_TIME),
+            },
+        )
+        .unwrap();
     }
 
-    // rayon goes brr
     dict.par_iter().for_each(|lines| {
-        crack(lines, hash_len, hash_input, now);
+        crack(app.clone(), lines, hash_len, hash_input, now);
     });
 
-    //Ok(())
+    Ok(())
 }
